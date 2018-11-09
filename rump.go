@@ -1,9 +1,10 @@
 package main
 
 import (
-	"os"
-	"fmt"
 	"flag"
+	"fmt"
+	"os"
+
 	"github.com/garyburd/redigo/redis"
 )
 
@@ -15,11 +16,18 @@ func handle(err error) {
 	}
 }
 
+// Structure to separate the key, the value, and the TTL
+type kvt struct {
+	key   string
+	value string
+	time  int64 //milliseconds via PTTL
+}
+
 // Scan and queue source keys.
-func get(conn redis.Conn, queue chan<- map[string]string) {
+func get(conn redis.Conn, queue chan<- kvt) {
 	var (
 		cursor int64
-		keys []string
+		keys   []string
 	)
 
 	for {
@@ -36,39 +44,37 @@ func get(conn redis.Conn, queue chan<- map[string]string) {
 		dumps, err := redis.Strings(conn.Do(""))
 		handle(err)
 
-		// Build batch map.
-		batch := make(map[string]string)
-		for i, _ := range keys {
-			batch[keys[i]] = dumps[i]
+		for _, key := range keys {
+			conn.Send("PTTL", key)
+		}
+
+		pttls, err := redis.Int64s(conn.Do(""))
+		handle(err)
+
+		for i, k := range keys {
+			queue <- kvt{k, dumps[i], pttls[i]}
 		}
 
 		// Last iteration of scan.
 		if cursor == 0 {
-			// queue last batch.
-			select {
-			case queue <- batch:
-			}
 			close(queue)
 			break
 		}
-
-		fmt.Printf(">")
-		// queue current batch.
-		queue <- batch
 	}
 }
 
 // Restore a batch of keys on destination.
-func put(conn redis.Conn, queue <-chan map[string]string) {
-	for batch := range queue {
-		for key, value := range batch {
-			conn.Send("RESTORE", key, "0", value)
+func put(conn redis.Conn, queue <-chan kvt) {
+	for kvt := range queue {
+		if kvt.time == -1 {
+			conn.Send("RESTORE", kvt.key, "0", kvt.value, "REPLACE")
+		} else {
+			conn.Send("RESTORE", kvt.key, kvt.time, kvt.value, "REPLACE")
 		}
-		_, err := conn.Do("")
-		handle(err)
-
-		fmt.Printf(".")
 	}
+
+	_, err := conn.Do("")
+	handle(err)
 }
 
 func main() {
@@ -84,7 +90,7 @@ func main() {
 	defer destination.Close()
 
 	// Channel where batches of keys will pass.
-	queue := make(chan map[string]string, 100)
+	queue := make(chan kvt, 100)
 
 	// Scan and send to queue.
 	go get(source, queue)
